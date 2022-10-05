@@ -1,0 +1,219 @@
+# WildFly Up and Running - TLS Demo
+:toc:               left
+:icons:             font
+:idprefix:
+:idseparator:       -
+:keywords:          wildfly,https,helm
+
+This example shows how to deploy a WildFly application on Kubernetes and access it using TLS.
+
+## Application
+
+The application is the same as the https://github.com/wildfly-up-and-running/wuar-demo[wuar-demo] and we can use its application image https://ghcr.io/wildfly-up-and-running/wuar-demo[ghcr.io/wildfly-up-and-running/wuar-demo].
+
+In this demo, we will create a TLS certificate, put it in a Secret in the Kubernete cluster and configure a Helm Chart so that WildFly will use this certifate for its HTTPS port.
+
+## Prerequisites
+
+In order to use HTTPS with this application, you need to create a keystore that contains the self-signed certificate and put it in a secret in Kubernetes.
+
+### Generate a keystore
+
+You can use the Java `keytool` command to generate a keystore:
+
+[source,bash]
+----
+keytool -genkey -keyalg RSA -keystore <keystore_filename.jks> -validity 360 -keysize 2048
+----
+
+For example, for this application , use the following command to generate a keystore:
+
+[source,bash]
+----
+keytool -genkey -keyalg RSA -keystore keystore.jks -validity 360 -keysize 2048
+----
+
+`keytool` will then ask information to generate the certificate:
+
+[source,options="nowrap"]
+----
+Enter keystore password: mypasswordxyz
+Re-enter new password: mypasswordxyz
+What is your first and last name?
+  [Unknown]:  Demo for WUAR with TLS
+What is the name of your organizational unit?
+  [Unknown]:  Up and Running
+What is the name of your organization?
+  [Unknown]:  WildFly
+What is the name of your City or Locality?
+  [Unknown]:  Internet
+What is the name of your State or Province?
+  [Unknown]:  WFLY
+What is the two-letter country code for this unit?
+  [Unknown]:  WF
+Is CN=Demo for WUAR with TLS, OU=Up and Running, O=WildFly, L=Internet, ST=WFLY, C=WF correct?
+  [no]:  yes
+----
+
+Note the `keystore password` that you are typing when prompted as we will need it later (in the example above, the password was `mypasswordxyz`).
+
+### Create a secret for this keystore
+
+In order to use that keystore on Kubernete, we need to store it in a Secret. We will also store the `keystore password` in that secret in order to read from the keystore.
+
+Create a secret from the previously created keystore and its secret using the following command:
+
+[source,bash]
+----
+kubectl create secret generic <secret_name> \    
+  --from-file=<keystore_filename.jks> \
+  --from-literal=keystore-password=<the keystore password>
+----
+
+For example, for this application, use the following command to create a secret:
+
+[source,bash]
+----
+kubectl create secret generic wuar-keystore-secret \
+  --from-file=keystore.jks \
+  --from-literal=keystore-password=mypasswordxyz
+----
+
+[NOTE]
+====
+We passed `mypasswordxyz` as the value of the keystore password as it is the password we typed when prompted by the `keytool` command. You will have to adjust that value to put your own password. 
+====
+
+## Installation
+
+To deploy the application on Kubernetes, we use `helm`:
+
+[source,bash]
+----
+helm install wuar-tls-demo wildfly \
+  -f https://raw.githubusercontent.com/wildfly-up-and-running/wuar-tls-demo/main/helm.yaml \
+  --repo https://docs.wildfly.org/wildfly-charts/
+----
+
+The `helm.yaml` configures WildFly to enable HTTPS.
+
+Let's specify these HTTPS environment variables when the application image is deployed:
+
+[source,yaml]
+----
+deploy:
+  env:
+    - name: HTTPS_KEYSTORE
+      value: keystore.jks
+    - name: HTTPS_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          key: keystore-password
+          name: wuar-keystore-secret
+    - name: HTTPS_KEYSTORE_DIR
+      value: /etc/wuar-keystore-secret
+----
+
+These environment variables must be specified:
+
+* `HTTPS_KEYSTORE` is the name of the keystore file (`keystore.jks``)
+* `HTTPS_PASSWORD` is the password to read data from the keystore. Its value is extracted from the `keystore-password` key in the `wuar-keystore-secret` secret.
+* `HTTPS_KEYSTORE_DIR` is the directory that contains the keystore (`/etc/wuar-keystore-secret`)
+
+We must also mount the `wuar-keystore-secret` secret to make it available to the server in the `/etc/wuar-keystore-secret` directory. To do so, we need to configure a `volume` and `volumeMount`:
+
+[source,yaml]
+----
+deploy:
+  volumes:
+    - name: wuar-keystore-secret-volume
+      secret:
+        secretName: wuar-keystore-secret
+  volumeMounts:
+    - name: wuar-keystore-secret-volume
+      mountPath: /etc/wuar-keystore-secret
+----
+
+Finally, we need to set the `deploy.tls.enabled` field to `true` to create a service for the HTTPS port.
+
+[source,yaml]
+----
+deploy:
+  tls:
+    enabled: true
+----
+
+## Deployment
+
+Once the chart is installed, let's wait for the application to be built and deployed:
+
+[source,options="nowrap"]
+----
+$ kubectl get deployment wuar-tls-demo -w
+NAME          READY   UP-TO-DATE   AVAILABLE   AGE
+wuar-tls-demo   1/1     1            1           4m41s
+----
+
+The application is now up and running on Kubernetes.
+
+## Access the application over HTTPS
+
+The application is not exposed oustide of the Kubernetes cluster so we will use Port Forwarding to access it from the outside by running:
+
+[source,options="nowrap"]
+----
+kubectl port-forward deployment/wuar-tls-demo 8443:8443
+----
+
+We can verify that the certificate that is used is the one that we created:
+
+[source,options="nowrap"]
+----
+$ keytool -printcert -sslserver localhost:8443
+
+Certificate #0
+====================================
+Owner: CN=Demo for WUAR with TLS, OU=Up and Running, O=WildFly, L=Internet, ST=WFLY, C=WF
+Issuer: CN=Demo for WUAR with TLS, OU=Up and Running, O=WildFly, L=Internet, ST=WFLY, C=WF
+...
+----
+
+
+If we query https://localhost:8443/ with curl, it will fail:
+
+[source,options="nowrap"]
+----
+$ curl -L https://localhost:8443/reverse
+
+curl: (60) SSL certificate problem: self signed certificate
+More details here: https://curl.se/docs/sslcerts.html
+
+curl failed to verify the legitimacy of the server and therefore could not
+establish a secure connection to it. To learn more about this situation and
+how to fix it, please visit the web page mentioned above.
+----
+
+As we have used a self-signed certificate, we need to configure curl to accept it with `-k`:
+
+[source,options="nowrap"]
+----
+$ curl -L -k https://localhost:8443/reverse?text=Ahoj
+johA
+----
+
+## Clean up
+
+The application can be deleted by running the command:
+
+[source,options="nowrap"]
+----
+helm delete wuar-tls-demo
+----
+
+We will also delete the secret that is used to store the keystore:
+
+[source,options="nowrap"]
+----
+kubectl delete secret wuar-keystore-secret
+----
+
